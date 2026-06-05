@@ -184,13 +184,29 @@ def open_bestand():
 
 @app.route('/api/export')
 def export_doc():
+    formaat = request.args.get('formaat', 'json')
     with get_db() as conn:
         row = conn.execute("SELECT html, bijgewerkt FROM document WHERE id=1").fetchone()
+    html  = row['html'] if row else ''
+    plain = html_to_plain(html)
+
+    if formaat == 'txt':
+        from flask import Response
+        return Response(plain, mimetype='text/plain; charset=utf-8')
+    if formaat == 'html':
+        from flask import Response
+        volledige = f"""<!DOCTYPE html>
+<html lang="nl"><head><meta charset="utf-8">
+<title>Logboek export</title>
+<style>body{{font-family:'Segoe UI',Arial,sans-serif;max-width:860px;margin:40px auto;padding:0 20px}}
+img{{max-width:100%}}.logvak{{border-top:2px solid #555;border-bottom:2px solid #555;padding:10px 0;margin:18px 0;font-family:'Courier New',monospace}}</style>
+</head><body>{html}</body></html>"""
+        return Response(volledige, mimetype='text/html; charset=utf-8')
     return jsonify(
         export=datetime.now().isoformat(timespec='seconds'),
         bijgewerkt=row['bijgewerkt'],
-        platte_tekst=html_to_plain(row['html']),
-        html=row['html']
+        platte_tekst=plain,
+        html=html
     )
 
 
@@ -441,6 +457,88 @@ body {
 }
 .modal-doos button:hover { background: #1a3f99; }
 
+/* ── vak verwijderen & inklappen ── */
+.logvak {
+  position: relative;
+}
+.vak-sluit {
+  display: none;
+  position: absolute;
+  top: 2px; right: 2px;
+  width: 20px; height: 20px;
+  background: #c0392b;
+  color: white;
+  border: none;
+  border-radius: 3px;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 5;
+}
+.logvak:hover .vak-sluit { display: block; }
+.vak-sluit:hover { background: #922b21; }
+
+.vak-scheiding-top {
+  cursor: pointer;
+  user-select: none;
+}
+.vak-scheiding-top:hover { color: #2255bb; }
+.logvak.ingeklapt .vak-rij { display: none; }
+.logvak.ingeklapt .vak-scheiding-top::after {
+  content: ' ▶ ingeklapt';
+  font-size: 9pt;
+  color: #999;
+}
+.logvak:not(.ingeklapt) .vak-scheiding-top::after {
+  content: ' ▼';
+  font-size: 9pt;
+  color: #aaa;
+}
+
+/* ── zoek & vervang paneel ── */
+#vervang-paneel {
+  display: none;
+  position: fixed;
+  top: 80px; right: 24px;
+  background: white;
+  border: 1px solid #bbb;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.2);
+  padding: 14px 16px;
+  z-index: 250;
+  min-width: 280px;
+  font-size: 13px;
+}
+#vervang-paneel.zichtbaar { display: block; }
+#vervang-paneel h3 { font-size: 13px; margin-bottom: 10px; color: #333; }
+#vervang-paneel input {
+  width: 100%; padding: 5px 8px;
+  border: 1px solid #bbb; border-radius: 3px;
+  font-size: 13px; margin-bottom: 6px;
+}
+#vervang-paneel .pnl-knoppen {
+  display: flex; gap: 6px; margin-top: 8px;
+}
+#vervang-paneel button {
+  flex: 1; padding: 5px 8px;
+  border: 1px solid #bbb; border-radius: 3px;
+  background: #f0f0f0; cursor: pointer; font-size: 12px;
+}
+#vervang-paneel button:hover { background: #d4e0f5; }
+#vervang-paneel .sluit-pnl {
+  position: absolute; top: 6px; right: 8px;
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; color: #888; flex: none; padding: 0;
+}
+
+/* ── print ── */
+@media print {
+  #menubar, #toolbar, #vervang-paneel { display: none !important; }
+  body { background: white !important; }
+  #papier-wrap { padding: 0 !important; }
+  #document { box-shadow: none !important; width: 100% !important; }
+}
+
 /* drag-over */
 body.drag-over::after {
   content: 'Laat los om afbeelding in te voegen';
@@ -465,14 +563,32 @@ body.drag-over::after {
     <h2>Welkom bij Logboek</h2>
     <p>Vul je naam in. Deze wordt automatisch ingevuld bij elk nieuw vak.</p>
     <input id="naam-input" type="text" placeholder="Jouw naam" autocomplete="name">
-    <button onclick="slaaNaamOp()">Opslaan &amp; beginnen</button>
+    <button onclick="slaaNaamOpEnUpdate()">Opslaan &amp; beginnen</button>
+  </div>
+</div>
+
+<!-- naam-modal wordt ook hergebruikt voor naam wijzigen -->
+
+<!-- zoek & vervang paneel -->
+<div id="vervang-paneel">
+  <button class="sluit-pnl" onclick="sluitVervang()">&#10005;</button>
+  <h3>Zoeken &amp; vervangen</h3>
+  <input id="vervang-zoek"    type="text" placeholder="Zoeken…">
+  <input id="vervang-door"    type="text" placeholder="Vervangen door…">
+  <div class="pnl-knoppen">
+    <button onclick="vervangEen()">Vervang</button>
+    <button onclick="vervangAlles()">Alles vervangen</button>
   </div>
 </div>
 
 <!-- menubalk -->
 <div id="menubar">
   <span onclick="kiesBestand()">&#128194; Openen (.txt / .docx)</span>
-  <span onclick="exporteer()">&#128229; Exporteren</span>
+  <span onclick="exporteerJSON()">&#128229; Export JSON</span>
+  <span onclick="exporteerHTML()">&#128196; Export HTML</span>
+  <span onclick="exporteerTXT()">&#128203; Export TXT</span>
+  <span onclick="window.print()">&#128438; Afdrukken</span>
+  <span onclick="wisselNaam()" id="naam-menu-label" style="margin-left:auto;color:#555;">&#128100; ...</span>
   <input type="file" id="bestand-input" accept=".txt,.docx" style="display:none" onchange="openBestand(this)">
 </div>
 
@@ -533,9 +649,12 @@ body.drag-over::after {
     <input type="file" id="foto-input" accept="image/*" style="display:none" onchange="uploadFoto(this)">
   </div>
 
-  <!-- zoek + status -->
+  <!-- zoek + navigatie + status -->
   <div class="tb-groep">
-    <input id="zoek-input" type="search" placeholder="Zoeken…" oninput="zoek(this.value)">
+    <input id="zoek-input" type="search" placeholder="Zoeken… (Ctrl+H vervangen)" oninput="zoek(this.value)" style="width:190px">
+    <button onclick="zoekNavigeer(-1)" title="Vorige">&#8249;</button>
+    <button onclick="zoekNavigeer(1)"  title="Volgende">&#8250;</button>
+    <span id="zoek-teller" style="font-size:11px;color:#666;padding:0 4px;white-space:nowrap;"></span>
     <span id="status-balk">klaar</span>
   </div>
 
@@ -589,10 +708,15 @@ async function laadDocument() {
   if (data.html) {
     doc.innerHTML = data.html;
   } else {
-    // leeg document — eerste keer
     doc.innerHTML = '<p><br></p>';
   }
   setStatus(data.bijgewerkt ? 'Opgeslagen: ' + netjesTijd(data.bijgewerkt) : 'Nieuw document');
+  document.getElementById('naam-menu-label').textContent = '👤 ' + gebruikersnaam;
+}
+
+async function slaaNaamOpEnUpdate() {
+  await slaaNaamOp();
+  document.getElementById('naam-menu-label').textContent = '👤 ' + gebruikersnaam;
 }
 
 // ── nieuw vak invoegen ────────────────────────────────────────────────────────
@@ -606,7 +730,8 @@ function voegVakIn() {
   // bouw het vak als HTML
   const vakHtml = `
 <div class="logvak" contenteditable="false">
-  <div class="vak-scheiding">════════════════════════════════════════════════════════════════</div>
+  <button class="vak-sluit" title="Vak verwijderen" onclick="verwijderVak(this)">&#10005;</button>
+  <div class="vak-scheiding vak-scheiding-top" onclick="klapVak(this)" title="Klik om in/uit te klappen">════════════════════════════════════════════════════════════════</div>
   <div class="vak-rij">
     <span class="vak-label">Datum/Tijd</span>
     <span class="vak-datum-tijd vak-inhoud">${datum} — ${tijd}</span>
@@ -766,14 +891,44 @@ async function openBestand(input) {
   documentGewijzigd();
 }
 
+// ── vak verwijderen & inklappen ──────────────────────────────────────────────
+
+function verwijderVak(knop) {
+  const vak = knop.closest('.logvak');
+  if (!vak) return;
+  if (!confirm('Dit logvak verwijderen?')) return;
+  vak.remove();
+  documentGewijzigd();
+}
+
+function klapVak(scheiding) {
+  const vak = scheiding.closest('.logvak');
+  if (vak) {
+    vak.classList.toggle('ingeklapt');
+    documentGewijzigd();
+  }
+}
+
+// ── naam wisselen ─────────────────────────────────────────────────────────────
+
+function wisselNaam() {
+  const input = document.getElementById('naam-input');
+  input.value = gebruikersnaam;
+  document.getElementById('naam-modal').classList.add('zichtbaar');
+  input.focus();
+  input.select();
+}
+
 // ── zoeken ────────────────────────────────────────────────────────────────────
 
+let zoekIndex = -1;
+
 function zoek(q) {
-  // verwijder bestaande markeringen
-  doc.querySelectorAll('mark.zoek-mark').forEach(m => {
-    m.replaceWith(...m.childNodes);
-  });
+  doc.querySelectorAll('mark.zoek-mark').forEach(m => m.replaceWith(...m.childNodes));
   doc.normalize();
+  zoekIndex = -1;
+  document.getElementById('zoek-teller').textContent = '';
+
   if (!q || q.length < 2) return;
 
   const walker = document.createTreeWalker(doc, NodeFilter.SHOW_TEXT);
@@ -800,22 +955,91 @@ function zoek(q) {
     n.parentNode.replaceChild(frag, n);
   });
 
-  const eerste = doc.querySelector('mark.zoek-mark');
-  if (eerste) eerste.scrollIntoView({ behavior:'smooth', block:'center' });
+  const alle = doc.querySelectorAll('mark.zoek-mark');
+  if (alle.length) {
+    zoekIndex = 0;
+    markeerActief(alle);
+    document.getElementById('zoek-teller').textContent = `1 / ${alle.length}`;
+  } else {
+    document.getElementById('zoek-teller').textContent = 'geen resultaten';
+  }
+}
+
+function zoekNavigeer(richting) {
+  const alle = doc.querySelectorAll('mark.zoek-mark');
+  if (!alle.length) return;
+  zoekIndex = (zoekIndex + richting + alle.length) % alle.length;
+  markeerActief(alle);
+  document.getElementById('zoek-teller').textContent = `${zoekIndex + 1} / ${alle.length}`;
+}
+
+function markeerActief(alle) {
+  alle.forEach((m, i) => {
+    m.style.background = i === zoekIndex ? '#ff9900' : '#fff176';
+  });
+  alle[zoekIndex].scrollIntoView({ behavior:'smooth', block:'center' });
+}
+
+// ── zoek & vervang ───────────────────────────────────────────────────────────
+
+function sluitVervang() {
+  document.getElementById('vervang-paneel').classList.remove('zichtbaar');
+}
+
+function vervangEen() {
+  const zoekT  = document.getElementById('vervang-zoek').value;
+  const doorT  = document.getElementById('vervang-door').value;
+  if (!zoekT) return;
+  const mark = doc.querySelector('mark.zoek-mark');
+  if (mark) {
+    mark.replaceWith(document.createTextNode(doorT));
+    doc.normalize();
+    documentGewijzigd();
+    zoek(zoekT);
+  }
+}
+
+function vervangAlles() {
+  const zoekT = document.getElementById('vervang-zoek').value;
+  const doorT = document.getElementById('vervang-door').value;
+  if (!zoekT) return;
+  const aantal = doc.querySelectorAll('mark.zoek-mark').length;
+  doc.querySelectorAll('mark.zoek-mark').forEach(m => {
+    m.replaceWith(document.createTextNode(doorT));
+  });
+  doc.normalize();
+  documentGewijzigd();
+  document.getElementById('zoek-teller').textContent = `${aantal} vervangen`;
+  document.getElementById('zoek-input').value = '';
 }
 
 // ── export ────────────────────────────────────────────────────────────────────
 
-async function exporteer() {
-  const data = await api('GET', '/api/export');
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = `logboek-${new Date().toISOString().slice(0,10)}.json`;
-  a.click();
+function downloadUrl(url, bestandsnaam) {
+  const a = document.createElement('a');
+  a.href = url; a.download = bestandsnaam; a.click();
   URL.revokeObjectURL(url);
 }
+
+async function exporteerJSON() {
+  const data = await api('GET', '/api/export');
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
+  downloadUrl(URL.createObjectURL(blob), `logboek-${datumVandaag()}.json`);
+}
+
+async function exporteerHTML() {
+  const res  = await fetch('/api/export?formaat=html');
+  const blob = await res.blob();
+  downloadUrl(URL.createObjectURL(blob), `logboek-${datumVandaag()}.html`);
+}
+
+async function exporteerTXT() {
+  const res  = await fetch('/api/export?formaat=txt');
+  const blob = await res.blob();
+  downloadUrl(URL.createObjectURL(blob), `logboek-${datumVandaag()}.txt`);
+}
+
+function datumVandaag() { return new Date().toISOString().slice(0,10); }
 
 // ── keyboard shortcuts ────────────────────────────────────────────────────────
 
@@ -825,6 +1049,18 @@ document.addEventListener('keydown', e => {
     if (e.key==='i') { e.preventDefault(); fmt('italic'); }
     if (e.key==='u') { e.preventDefault(); fmt('underline'); }
     if (e.key==='s') { e.preventDefault(); bewaar(); }
+    if (e.key==='h') {
+      e.preventDefault();
+      document.getElementById('vervang-paneel').classList.toggle('zichtbaar');
+      if (document.getElementById('vervang-paneel').classList.contains('zichtbaar')) {
+        document.getElementById('vervang-zoek').focus();
+      }
+    }
+  }
+  if (e.key === 'Escape') {
+    sluitVervang();
+    document.getElementById('zoek-input').value = '';
+    zoek('');
   }
 });
 
