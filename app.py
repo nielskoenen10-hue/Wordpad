@@ -152,20 +152,22 @@ def open_bestand():
 
     if ext == '.txt':
         tekst = f.read().decode('utf-8', errors='replace')
+        stijl = "font-size:12pt;font-family:'Segoe UI',Arial,sans-serif;"
         delen = []
         for regel in tekst.splitlines():
             esc = regel.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-            delen.append(f'<p>{esc or "<br>"}</p>')
+            delen.append(f'<p style="{stijl}">{esc or "<br>"}</p>')
         return jsonify(html=''.join(delen))
 
     if ext == '.docx':
         if not DOCX_SUPPORT:
             return jsonify(error='python-docx niet geïnstalleerd'), 501
-        doc   = DocxDocument(io.BytesIO(f.read()))
+        doc      = DocxDocument(io.BytesIO(f.read()))
+        basestijl = "font-size:12pt;font-family:'Segoe UI',Arial,sans-serif;"
         delen = []
         for para in doc.paragraphs:
-            stijl = (para.style.name or '').lower()
-            tag   = 'h1' if 'heading 1' in stijl else 'h2' if 'heading 2' in stijl else 'p'
+            pstijl = (para.style.name or '').lower()
+            tag    = 'h1' if 'heading 1' in pstijl else 'h2' if 'heading 2' in pstijl else 'p'
             inhoud = ''
             for run in para.runs:
                 t = run.text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
@@ -173,7 +175,8 @@ def open_bestand():
                 if run.italic:    t = f'<em>{t}</em>'
                 if run.underline: t = f'<u>{t}</u>'
                 inhoud += t
-            delen.append(f'<{tag}>{inhoud or "<br>"}</{tag}>')
+            css = '' if tag != 'p' else f' style="{basestijl}"'
+            delen.append(f'<{tag}{css}>{inhoud or "<br>"}</{tag}>')
         return jsonify(html=''.join(delen))
 
     return jsonify(error=f'Bestandstype {ext} niet ondersteund'), 415
