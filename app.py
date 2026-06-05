@@ -1,14 +1,13 @@
 import os
 import uuid
-import json
 import sqlite3
 import re
+import io
 from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_from_directory, render_template_string
 from PIL import Image
-import io
 
 try:
     from docx import Document as DocxDocument
@@ -18,13 +17,13 @@ except ImportError:
 
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "logboek.db"
-FOTOS_DIR = BASE_DIR / "fotos"
+BASE_DIR   = Path(__file__).parent
+DB_PATH    = BASE_DIR / "logboek.db"
+FOTOS_DIR  = BASE_DIR / "fotos"
 FOTOS_DIR.mkdir(exist_ok=True)
 
 MAX_IMAGE_WIDTH = 1600
-JPEG_QUALITY = 82
+JPEG_QUALITY    = 82
 
 
 def get_db():
@@ -40,30 +39,19 @@ def init_db():
                 sleutel TEXT PRIMARY KEY,
                 waarde  TEXT
             );
-            CREATE TABLE IF NOT EXISTS notities (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                aangemaakt  TEXT NOT NULL,
-                vergrendeld INTEGER NOT NULL DEFAULT 0,
+            CREATE TABLE IF NOT EXISTS document (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
                 html        TEXT NOT NULL DEFAULT '',
-                platte_tekst TEXT NOT NULL DEFAULT ''
+                bijgewerkt  TEXT NOT NULL DEFAULT ''
             );
+            INSERT OR IGNORE INTO document(id, html, bijgewerkt) VALUES(1,'','');
         """)
 
 
 init_db()
 
 
-def html_to_plain(html: str) -> str:
-    text = re.sub(r'<img[^>]*>', ' [afbeelding] ', html)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'&nbsp;', ' ', text)
-    text = re.sub(r'&lt;', '<', text)
-    text = re.sub(r'&gt;', '>', text)
-    text = re.sub(r'&amp;', '&', text)
-    return re.sub(r'\s+', ' ', text).strip()
-
-
-def compress_image(data: bytes, mime: str) -> tuple[bytes, str]:
+def compress_image(data: bytes) -> bytes:
     img = Image.open(io.BytesIO(data))
     if img.mode not in ('RGB', 'L'):
         img = img.convert('RGB')
@@ -72,10 +60,18 @@ def compress_image(data: bytes, mime: str) -> tuple[bytes, str]:
         img = img.resize((MAX_IMAGE_WIDTH, int(img.height * ratio)), Image.LANCZOS)
     out = io.BytesIO()
     img.save(out, format='JPEG', quality=JPEG_QUALITY, optimize=True)
-    return out.getvalue(), 'image/jpeg'
+    return out.getvalue()
 
 
-# ── Routes ──────────────────────────────────────────────────────────────────
+def html_to_plain(html: str) -> str:
+    text = re.sub(r'<img[^>]*>', ' [afbeelding] ', html)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    for ent, ch in [('&nbsp;',' '),('&lt;','<'),('&gt;','>'),('&amp;','&')]:
+        text = text.replace(ent, ch)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+# ── API ──────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
@@ -97,82 +93,46 @@ def set_instellingen():
             conn.execute(
                 "INSERT INTO instellingen(sleutel,waarde) VALUES(?,?) "
                 "ON CONFLICT(sleutel) DO UPDATE SET waarde=excluded.waarde",
-                (k, v)
-            )
+                (k, v))
     return jsonify(ok=True)
 
 
-@app.route('/api/notities', methods=['GET'])
-def get_notities():
+@app.route('/api/document', methods=['GET'])
+def get_document():
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, aangemaakt, vergrendeld, html FROM notities ORDER BY id"
-        ).fetchall()
-    return jsonify([dict(r) for r in rows])
+        row = conn.execute("SELECT html, bijgewerkt FROM document WHERE id=1").fetchone()
+    return jsonify(html=row['html'], bijgewerkt=row['bijgewerkt'])
 
 
-@app.route('/api/notities', methods=['POST'])
-def maak_notitie():
+@app.route('/api/document', methods=['PUT'])
+def put_document():
     data = request.get_json(force=True)
     html = data.get('html', '')
-    aangemaakt = datetime.now().isoformat(timespec='seconds')
-    plain = html_to_plain(html)
+    nu   = datetime.now().isoformat(timespec='seconds')
     with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO notities(aangemaakt, html, platte_tekst) VALUES(?,?,?)",
-            (aangemaakt, html, plain)
-        )
-        nid = cur.lastrowid
-    return jsonify(id=nid, aangemaakt=aangemaakt)
-
-
-@app.route('/api/notities/<int:nid>', methods=['PUT'])
-def update_notitie(nid):
-    with get_db() as conn:
-        row = conn.execute("SELECT vergrendeld FROM notities WHERE id=?", (nid,)).fetchone()
-        if not row:
-            return jsonify(error='niet gevonden'), 404
-        if row['vergrendeld']:
-            return jsonify(error='vergrendeld'), 403
-        data = request.get_json(force=True)
-        html = data.get('html', '')
-        plain = html_to_plain(html)
-        conn.execute(
-            "UPDATE notities SET html=?, platte_tekst=? WHERE id=?",
-            (html, plain, nid)
-        )
-    return jsonify(ok=True)
-
-
-@app.route('/api/notities/<int:nid>/vergrendel', methods=['POST'])
-def vergrendel(nid):
-    with get_db() as conn:
-        conn.execute("UPDATE notities SET vergrendeld=1 WHERE id=?", (nid,))
-    return jsonify(ok=True)
+        conn.execute("UPDATE document SET html=?, bijgewerkt=? WHERE id=1", (html, nu))
+    return jsonify(ok=True, bijgewerkt=nu)
 
 
 @app.route('/api/zoek')
 def zoek():
     q = request.args.get('q', '').strip()
     if not q:
-        return jsonify([])
-    like = f'%{q}%'
+        return jsonify(resultaten=[], totaal=0)
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, aangemaakt, vergrendeld, html FROM notities "
-            "WHERE platte_tekst LIKE ? ORDER BY id DESC",
-            (like,)
-        ).fetchall()
-    return jsonify([dict(r) for r in rows])
+        row = conn.execute("SELECT html FROM document WHERE id=1").fetchone()
+    html  = row['html'] if row else ''
+    plain = html_to_plain(html)
+    aantal = plain.lower().count(q.lower())
+    return jsonify(resultaten=aantal, totaal=len(plain))
 
 
 @app.route('/api/foto', methods=['POST'])
 def upload_foto():
     if 'file' not in request.files:
         return jsonify(error='geen bestand'), 400
-    f = request.files['file']
-    raw = f.read()
-    data, mime = compress_image(raw, f.content_type or 'image/jpeg')
+    f    = request.files['file']
+    data = compress_image(f.read())
     naam = f"{uuid.uuid4().hex}.jpg"
     (FOTOS_DIR / naam).write_bytes(data)
     return jsonify(url=f'/fotos/{naam}')
@@ -185,73 +145,53 @@ def serve_foto(naam):
 
 @app.route('/api/open', methods=['POST'])
 def open_bestand():
-    """Open een .txt of .docx bestand en geef HTML terug."""
     if 'file' not in request.files:
         return jsonify(error='geen bestand'), 400
-    f = request.files['file']
-    naam = f.filename or ''
-    ext = Path(naam).suffix.lower()
+    f   = request.files['file']
+    ext = Path(f.filename or '').suffix.lower()
 
     if ext == '.txt':
         tekst = f.read().decode('utf-8', errors='replace')
-        regels = tekst.splitlines()
-        html_delen = []
-        for regel in regels:
-            escaped = (regel
-                       .replace('&', '&amp;')
-                       .replace('<', '&lt;')
-                       .replace('>', '&gt;'))
-            html_delen.append(f'<p>{escaped if escaped else "<br>"}</p>')
-        return jsonify(html=''.join(html_delen), naam=naam)
+        delen = []
+        for regel in tekst.splitlines():
+            esc = regel.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+            delen.append(f'<p>{esc or "<br>"}</p>')
+        return jsonify(html=''.join(delen))
 
     if ext == '.docx':
         if not DOCX_SUPPORT:
             return jsonify(error='python-docx niet geïnstalleerd'), 501
-        raw = f.read()
-        doc = DocxDocument(io.BytesIO(raw))
-        html_delen = []
+        doc   = DocxDocument(io.BytesIO(f.read()))
+        delen = []
         for para in doc.paragraphs:
-            stijl = para.style.name.lower() if para.style else ''
-            tag = 'p'
-            if 'heading 1' in stijl:
-                tag = 'h1'
-            elif 'heading 2' in stijl:
-                tag = 'h2'
-            elif 'heading 3' in stijl:
-                tag = 'h3'
-
+            stijl = (para.style.name or '').lower()
+            tag   = 'h1' if 'heading 1' in stijl else 'h2' if 'heading 2' in stijl else 'p'
             inhoud = ''
             for run in para.runs:
-                tekst = (run.text
-                         .replace('&', '&amp;')
-                         .replace('<', '&lt;')
-                         .replace('>', '&gt;'))
-                if run.bold:
-                    tekst = f'<strong>{tekst}</strong>'
-                if run.italic:
-                    tekst = f'<em>{tekst}</em>'
-                if run.underline:
-                    tekst = f'<u>{tekst}</u>'
-                inhoud += tekst
-
-            html_delen.append(f'<{tag}>{inhoud if inhoud else "<br>"}</{tag}>')
-        return jsonify(html=''.join(html_delen), naam=naam)
+                t = run.text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                if run.bold:      t = f'<strong>{t}</strong>'
+                if run.italic:    t = f'<em>{t}</em>'
+                if run.underline: t = f'<u>{t}</u>'
+                inhoud += t
+            delen.append(f'<{tag}>{inhoud or "<br>"}</{tag}>')
+        return jsonify(html=''.join(delen))
 
     return jsonify(error=f'Bestandstype {ext} niet ondersteund'), 415
 
 
 @app.route('/api/export')
-def export_alle():
+def export_doc():
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT aangemaakt, vergrendeld, html FROM notities ORDER BY id"
-        ).fetchall()
-    items = [dict(r) for r in rows]
-    export_tijd = datetime.now().isoformat(timespec='seconds')
-    return jsonify(export=export_tijd, notities=items)
+        row = conn.execute("SELECT html, bijgewerkt FROM document WHERE id=1").fetchone()
+    return jsonify(
+        export=datetime.now().isoformat(timespec='seconds'),
+        bijgewerkt=row['bijgewerkt'],
+        platte_tekst=html_to_plain(row['html']),
+        html=row['html']
+    )
 
 
-# ── HTML + JS (inline voor één-bestand-deployment) ──────────────────────────
+# ── HTML/CSS/JS ──────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="nl">
@@ -260,288 +200,333 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Logboek</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  body {
-    font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
-    background: #e8e8e8;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
+body {
+  font-family: 'Segoe UI', Arial, sans-serif;
+  background: #ababab;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
 
-  /* ── toolbar ── */
-  #toolbar {
-    position: sticky; top: 0; z-index: 100;
-    background: #f3f3f3;
-    border-bottom: 1px solid #c8c8c8;
-    padding: 4px 8px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    align-items: center;
-    box-shadow: 0 1px 3px rgba(0,0,0,.15);
-  }
+/* ── menubalk (WordPad-stijl) ── */
+#menubar {
+  background: #f0f0f0;
+  border-bottom: 1px solid #999;
+  padding: 2px 4px;
+  font-size: 12px;
+  display: flex;
+  gap: 2px;
+}
+#menubar span {
+  padding: 3px 8px;
+  border-radius: 2px;
+  cursor: default;
+  color: #222;
+}
+#menubar span:hover { background: #d0d8e8; }
 
-  #toolbar button, #toolbar select, #toolbar input[type=color] {
-    height: 28px;
-    border: 1px solid #bbb;
-    border-radius: 3px;
-    background: white;
-    cursor: pointer;
-    font-size: 13px;
-    padding: 0 6px;
-  }
-  #toolbar button:hover { background: #dde; }
-  #toolbar button.actief { background: #c5d8f5; border-color: #7aabf0; }
+/* ── toolbar ── */
+#toolbar {
+  background: linear-gradient(to bottom, #fefefe 0%, #e8e8e8 100%);
+  border-bottom: 1px solid #aaa;
+  padding: 4px 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  align-items: center;
+  box-shadow: 0 1px 2px rgba(0,0,0,.12);
+}
 
-  #toolbar select { padding: 0 2px; }
-  #toolbar input[type=color] { width: 28px; padding: 2px; }
+.tb-groep {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  padding: 0 4px;
+  border-right: 1px solid #ccc;
+}
+.tb-groep:last-child { border-right: none; margin-left: auto; }
 
-  .toolbar-sep {
-    width: 1px; height: 22px;
-    background: #c0c0c0;
-    margin: 0 2px;
-  }
+#toolbar button {
+  height: 26px;
+  min-width: 26px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 5px;
+  color: #222;
+}
+#toolbar button:hover  { background: #d4e0f5; border-color: #90b0e0; }
+#toolbar button:active { background: #b8ccf0; }
 
-  /* ── zoek + acties rechts ── */
-  #toolbar-rechts {
-    margin-left: auto;
-    display: flex; gap: 6px; align-items: center;
-  }
-  #zoek-input {
-    height: 28px; border: 1px solid #bbb; border-radius: 3px;
-    padding: 0 8px; font-size: 13px; width: 180px;
-  }
+#toolbar select {
+  height: 24px;
+  border: 1px solid #bbb;
+  border-radius: 2px;
+  background: white;
+  font-size: 12px;
+  padding: 0 2px;
+}
+#toolbar input[type=color] {
+  width: 26px; height: 26px;
+  border: 1px solid #bbb;
+  border-radius: 2px;
+  padding: 1px;
+  cursor: pointer;
+}
 
-  /* ── hoofdgebied ── */
-  #hoofd {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 24px 16px 80px;
-    gap: 20px;
-  }
+/* NIEUW VAK knop — opvallend */
+#btn-nieuwvak {
+  background: #2255bb !important;
+  color: white !important;
+  border-color: #1a3f99 !important;
+  font-weight: 600;
+  padding: 0 12px !important;
+  height: 26px;
+  border-radius: 2px;
+}
+#btn-nieuwvak:hover { background: #1a3f99 !important; }
 
-  /* ── notitie-kaart ── */
-  .notitie-kaart {
-    width: 100%;
-    max-width: 860px;
-    background: white;
-    border-radius: 2px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.18);
-    overflow: hidden;
-  }
-  .notitie-header {
-    display: flex;
-    align-items: center;
-    padding: 6px 12px;
-    background: #f8f8f8;
-    border-bottom: 1px solid #e0e0e0;
-    font-size: 12px;
-    color: #666;
-    gap: 8px;
-  }
-  .notitie-header .slot {
-    font-weight: 600;
-    color: #333;
-  }
-  .vergrendeld-badge {
-    margin-left: auto;
-    font-size: 11px;
-    background: #ffe082;
-    color: #7a5500;
-    border-radius: 3px;
-    padding: 1px 6px;
-  }
-  .notitie-editor {
-    min-height: 120px;
-    padding: 16px 20px;
-    outline: none;
-    font-size: 15px;
-    line-height: 1.65;
-    color: #1a1a1a;
-  }
-  .notitie-editor img {
-    max-width: 100%;
-    height: auto;
-    display: block;
-    margin: 8px 0;
-    border-radius: 2px;
-  }
-  .notitie-editor[contenteditable=false] {
-    background: #fafafa;
-    color: #333;
-  }
-  .notitie-footer {
-    display: flex;
-    justify-content: flex-end;
-    padding: 6px 12px;
-    gap: 8px;
-    border-top: 1px solid #efefef;
-  }
-  .notitie-footer button {
-    font-size: 12px;
-    padding: 3px 10px;
-    border: 1px solid #bbb;
-    border-radius: 3px;
-    background: white;
-    cursor: pointer;
-  }
-  .notitie-footer button:hover { background: #eef; }
-  .notitie-footer .btn-vergrendel {
-    background: #fff3cd;
-    border-color: #f0c040;
-    color: #7a5500;
-  }
+#zoek-input {
+  height: 24px;
+  border: 1px solid #bbb;
+  border-radius: 2px;
+  padding: 0 8px;
+  font-size: 12px;
+  width: 160px;
+}
+#status-balk {
+  font-size: 11px;
+  color: #666;
+  padding: 0 6px;
+  white-space: nowrap;
+}
 
-  /* ── nieuwe-notitie knop ── */
-  #btn-nieuw {
-    width: 100%;
-    max-width: 860px;
-    padding: 12px;
-    background: white;
-    border: 2px dashed #bbb;
-    border-radius: 2px;
-    font-size: 15px;
-    color: #888;
-    cursor: pointer;
-    transition: border-color .15s, color .15s;
-  }
-  #btn-nieuw:hover { border-color: #7aabf0; color: #3366cc; }
+/* ── papier ── */
+#papier-wrap {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 0 60px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
 
-  /* ── naammodal ── */
-  #naam-modal {
-    display: none;
-    position: fixed; inset: 0;
-    background: rgba(0,0,0,.45);
-    z-index: 200;
-    align-items: center;
-    justify-content: center;
-  }
-  #naam-modal.zichtbaar { display: flex; }
-  #naam-modal .doos {
-    background: white;
-    border-radius: 6px;
-    padding: 32px 40px;
-    max-width: 360px;
-    width: 90%;
-    box-shadow: 0 8px 32px rgba(0,0,0,.25);
-  }
-  #naam-modal h2 { margin-bottom: 12px; font-size: 18px; }
-  #naam-modal p  { font-size: 13px; color: #555; margin-bottom: 20px; }
-  #naam-input {
-    width: 100%; padding: 8px 12px;
-    border: 1px solid #bbb; border-radius: 4px;
-    font-size: 15px; margin-bottom: 16px;
-  }
-  #naam-modal button {
-    width: 100%; padding: 10px;
-    background: #3366cc; color: white;
-    border: none; border-radius: 4px;
-    font-size: 15px; cursor: pointer;
-  }
-  #naam-modal button:hover { background: #254fa8; }
+#document {
+  width: 794px;          /* A4-breedte bij 96dpi */
+  min-height: 1123px;
+  background: white;
+  box-shadow: 0 2px 8px rgba(0,0,0,.35);
+  padding: 60px 72px;
+  outline: none;
+  font-size: 13pt;
+  line-height: 1.6;
+  color: #111;
+  caret-color: #000;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
 
-  /* ── drag-over overlay ── */
-  body.drag-over::after {
-    content: 'Laat los om afbeelding in te voegen';
-    position: fixed; inset: 0;
-    background: rgba(50,100,220,.18);
-    border: 4px dashed #3366cc;
-    z-index: 300;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 22px; color: #3366cc; pointer-events: none;
-  }
+/* vak-blok */
+.logvak {
+  margin: 18px 0;
+  border-top: 2px solid #555;
+  border-bottom: 2px solid #555;
+  padding: 10px 0;
+  font-family: 'Courier New', monospace;
+  font-size: 11pt;
+}
+.logvak .vak-scheiding {
+  color: #555;
+  letter-spacing: 1px;
+  user-select: none;
+  font-size: 10pt;
+  line-height: 1.2;
+}
+.logvak .vak-rij {
+  display: flex;
+  gap: 12px;
+  padding: 3px 0;
+}
+.logvak .vak-label {
+  color: #777;
+  min-width: 100px;
+  font-size: 10pt;
+  user-select: none;
+}
+.logvak .vak-inhoud {
+  flex: 1;
+  outline: none;
+  min-height: 1.4em;
+  font-family: inherit;
+  font-size: inherit;
+  color: #111;
+  border-bottom: 1px dashed #ccc;
+}
+.logvak .vak-datum-tijd { color: #333; font-weight: 600; }
+
+#document img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 6px 0;
+}
+
+/* ── naam-modal ── */
+#naam-modal {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.5);
+  z-index: 300;
+  align-items: center;
+  justify-content: center;
+}
+#naam-modal.zichtbaar { display: flex; }
+.modal-doos {
+  background: white;
+  border-radius: 4px;
+  padding: 28px 36px;
+  max-width: 340px;
+  width: 90%;
+  box-shadow: 0 6px 24px rgba(0,0,0,.3);
+}
+.modal-doos h2 { font-size: 16px; margin-bottom: 8px; }
+.modal-doos p  { font-size: 12px; color: #555; margin-bottom: 16px; }
+.modal-doos input {
+  width: 100%; padding: 7px 10px;
+  border: 1px solid #bbb; border-radius: 3px;
+  font-size: 14px; margin-bottom: 14px;
+}
+.modal-doos button {
+  width: 100%; padding: 8px;
+  background: #2255bb; color: white;
+  border: none; border-radius: 3px;
+  font-size: 14px; cursor: pointer;
+}
+.modal-doos button:hover { background: #1a3f99; }
+
+/* drag-over */
+body.drag-over::after {
+  content: 'Laat los om afbeelding in te voegen';
+  position: fixed; inset: 0;
+  background: rgba(34,85,187,.15);
+  border: 4px dashed #2255bb;
+  z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; color: #2255bb; pointer-events: none;
+}
+
+@media (max-width: 860px) {
+  #document { width: 100%; padding: 32px 20px; }
+}
 </style>
 </head>
 <body>
 
 <!-- naam-modal -->
 <div id="naam-modal">
-  <div class="doos">
+  <div class="modal-doos">
     <h2>Welkom bij Logboek</h2>
-    <p>Vul je naam in. Deze wordt automatisch bij elke notitie gezet en onthouden.</p>
+    <p>Vul je naam in. Deze wordt automatisch ingevuld bij elk nieuw vak.</p>
     <input id="naam-input" type="text" placeholder="Jouw naam" autocomplete="name">
     <button onclick="slaaNaamOp()">Opslaan &amp; beginnen</button>
   </div>
 </div>
 
-<!-- toolbar -->
-<div id="toolbar">
-  <!-- opmaak -->
-  <button title="Vet (Ctrl+B)" onclick="fmt('bold')"><b>B</b></button>
-  <button title="Cursief (Ctrl+I)" onclick="fmt('italic')"><i>I</i></button>
-  <button title="Onderstrepen (Ctrl+U)" onclick="fmt('underline')"><u>U</u></button>
-  <div class="toolbar-sep"></div>
-
-  <!-- lettertype -->
-  <select id="sel-font" title="Lettertype" onchange="fmtFont(this.value)">
-    <option value="'Segoe UI',sans-serif">Segoe UI</option>
-    <option value="Arial,sans-serif">Arial</option>
-    <option value="'Times New Roman',serif">Times New Roman</option>
-    <option value="'Courier New',monospace">Courier New</option>
-    <option value="Georgia,serif">Georgia</option>
-    <option value="Verdana,sans-serif">Verdana</option>
-  </select>
-
-  <select id="sel-size" title="Lettergrootte" onchange="fmtSize(this.value)">
-    <option value="10">10</option>
-    <option value="11">11</option>
-    <option value="12" selected>12</option>
-    <option value="14">14</option>
-    <option value="16">16</option>
-    <option value="18">18</option>
-    <option value="20">20</option>
-    <option value="24">24</option>
-    <option value="28">28</option>
-    <option value="36">36</option>
-  </select>
-
-  <input type="color" id="kleur-kiezer" title="Tekstkleur" value="#000000" onchange="fmtKleur(this.value)">
-  <div class="toolbar-sep"></div>
-
-  <!-- lijsten -->
-  <button title="Opsomming" onclick="fmt('insertUnorderedList')">&#8226; lijst</button>
-  <button title="Genummerde lijst" onclick="fmt('insertOrderedList')">1. lijst</button>
-  <div class="toolbar-sep"></div>
-
-  <!-- uitlijning -->
-  <button title="Links" onclick="fmt('justifyLeft')">&#8676;</button>
-  <button title="Midden" onclick="fmt('justifyCenter')">&#8596;</button>
-  <button title="Rechts" onclick="fmt('justifyRight')">&#8677;</button>
-  <div class="toolbar-sep"></div>
-
-  <!-- afbeelding invoegen -->
-  <button title="Afbeelding invoegen" onclick="kiesFoto()">&#128247; Foto</button>
-  <input type="file" id="foto-input" accept="image/*" style="display:none" onchange="uploadFoto(this)">
-
-  <!-- bestand openen -->
-  <button title="Bestand openen (.txt of .docx)" onclick="kiesBestand()">&#128194; Openen</button>
+<!-- menubalk -->
+<div id="menubar">
+  <span onclick="kiesBestand()">&#128194; Openen (.txt / .docx)</span>
+  <span onclick="exporteer()">&#128229; Exporteren</span>
   <input type="file" id="bestand-input" accept=".txt,.docx" style="display:none" onchange="openBestand(this)">
-
-  <!-- rechts: zoek + export -->
-  <div id="toolbar-rechts">
-    <input id="zoek-input" type="search" placeholder="Zoeken…" oninput="zoek(this.value)">
-    <button title="Exporteer alle notities als JSON" onclick="exporteer()">&#128229; Export</button>
-  </div>
 </div>
 
-<!-- hoofdgebied -->
-<div id="hoofd">
-  <button id="btn-nieuw" onclick="nieuweNotitie()">+ Nieuwe notitie</button>
+<!-- toolbar -->
+<div id="toolbar">
+
+  <!-- Nieuw vak -->
+  <div class="tb-groep">
+    <button id="btn-nieuwvak" onclick="voegVakIn()" title="Nieuw logvak invoegen met datum, tijd en naam">
+      &#43; Nieuw vak
+    </button>
+  </div>
+
+  <!-- opmaak -->
+  <div class="tb-groep">
+    <button onclick="fmt('bold')"      title="Vet (Ctrl+B)"><b>V</b></button>
+    <button onclick="fmt('italic')"    title="Cursief (Ctrl+I)"><i>C</i></button>
+    <button onclick="fmt('underline')" title="Onderstrepen (Ctrl+U)"><u>O</u></button>
+  </div>
+
+  <!-- lettertype -->
+  <div class="tb-groep">
+    <select id="sel-font" title="Lettertype" onchange="fmtFont(this.value)">
+      <option value="'Segoe UI',sans-serif">Segoe UI</option>
+      <option value="Arial,sans-serif">Arial</option>
+      <option value="'Times New Roman',serif">Times New Roman</option>
+      <option value="'Courier New',monospace">Courier New</option>
+      <option value="Georgia,serif">Georgia</option>
+      <option value="Verdana,sans-serif">Verdana</option>
+    </select>
+    <select id="sel-size" title="Lettergrootte" onchange="fmtSize(this.value)">
+      <option value="9">9</option>
+      <option value="10">10</option>
+      <option value="11">11</option>
+      <option value="12" selected>12</option>
+      <option value="14">14</option>
+      <option value="16">16</option>
+      <option value="18">18</option>
+      <option value="20">20</option>
+      <option value="24">24</option>
+    </select>
+    <input type="color" id="kleur-kiezer" value="#000000" title="Tekstkleur"
+           onchange="fmtKleur(this.value)">
+  </div>
+
+  <!-- lijsten + uitlijning -->
+  <div class="tb-groep">
+    <button onclick="fmt('insertUnorderedList')" title="Opsomming">&#8226;</button>
+    <button onclick="fmt('insertOrderedList')"   title="Genummerd">1.</button>
+    <button onclick="fmt('justifyLeft')"   title="Links">&#8676;</button>
+    <button onclick="fmt('justifyCenter')" title="Midden">&#8596;</button>
+    <button onclick="fmt('justifyRight')"  title="Rechts">&#8677;</button>
+  </div>
+
+  <!-- foto -->
+  <div class="tb-groep">
+    <button onclick="kiesFoto()" title="Afbeelding invoegen">&#128247; Foto</button>
+    <input type="file" id="foto-input" accept="image/*" style="display:none" onchange="uploadFoto(this)">
+  </div>
+
+  <!-- zoek + status -->
+  <div class="tb-groep">
+    <input id="zoek-input" type="search" placeholder="Zoeken…" oninput="zoek(this.value)">
+    <span id="status-balk">klaar</span>
+  </div>
+
+</div>
+
+<!-- papier -->
+<div id="papier-wrap">
+  <div id="document" contenteditable="true"
+       spellcheck="true"
+       onpaste="verwerkPlak(event)"
+       oninput="documentGewijzigd()">
+  </div>
 </div>
 
 <script>
 'use strict';
 
 let gebruikersnaam = '';
-let huidigeFocusId = null;   // id van de notitie die nu focus heeft
-let bewaarTimer = null;
-const notities = {};          // id -> { html, vergrendeld }
+let bewaarTimer    = null;
+let zoekMarkeringen = [];
 
-// ── initialisatie ────────────────────────────────────────────────────────
+const doc = document.getElementById('document');
+
+// ── init ─────────────────────────────────────────────────────────────────────
 
 async function init() {
   const inst = await api('GET', '/api/instellingen');
@@ -551,7 +536,7 @@ async function init() {
     document.getElementById('naam-modal').classList.add('zichtbaar');
     return;
   }
-  await laadAlles();
+  await laadDocument();
 }
 
 async function slaaNaamOp() {
@@ -560,170 +545,126 @@ async function slaaNaamOp() {
   gebruikersnaam = v;
   await api('POST', '/api/instellingen', { naam: v });
   document.getElementById('naam-modal').classList.remove('zichtbaar');
-  await laadAlles();
+  await laadDocument();
 }
-
 document.getElementById('naam-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') slaaNaamOp();
 });
 
-async function laadAlles() {
-  const lijst = await api('GET', '/api/notities');
-  const hoofd = document.getElementById('hoofd');
-  const btnNieuw = document.getElementById('btn-nieuw');
-  // verwijder bestaande kaarten
-  hoofd.querySelectorAll('.notitie-kaart').forEach(el => el.remove());
-  for (const n of lijst) {
-    notities[n.id] = { html: n.html, vergrendeld: n.vergrendeld };
-    const kaart = maakKaart(n.id, n.aangemaakt, n.html, !!n.vergrendeld);
-    hoofd.insertBefore(kaart, btnNieuw);
+async function laadDocument() {
+  const data = await api('GET', '/api/document');
+  if (data.html) {
+    doc.innerHTML = data.html;
+  } else {
+    // leeg document — eerste keer
+    doc.innerHTML = '<p><br></p>';
   }
-  btnNieuw.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  setStatus(data.bijgewerkt ? 'Opgeslagen: ' + netjesTijd(data.bijgewerkt) : 'Nieuw document');
 }
 
-// ── notitie kaart ─────────────────────────────────────────────────────────
+// ── nieuw vak invoegen ────────────────────────────────────────────────────────
 
-function maakKaart(id, aangemaakt, html, vergrendeld) {
-  const kaart = document.createElement('div');
-  kaart.className = 'notitie-kaart';
-  kaart.dataset.id = id;
+function voegVakIn() {
+  const nu       = new Date();
+  const datum    = nu.toLocaleDateString('nl-NL', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+  const tijd     = nu.toLocaleTimeString('nl-NL', { hour:'2-digit', minute:'2-digit' });
+  const naam     = escHtml(gebruikersnaam);
 
-  const header = document.createElement('div');
-  header.className = 'notitie-header';
-  const dt = new Date(aangemaakt);
-  const datumStr = dt.toLocaleDateString('nl-NL', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
-  const tijdStr  = dt.toLocaleTimeString('nl-NL', { hour:'2-digit', minute:'2-digit' });
-  header.innerHTML = `<span class="slot">${datumStr} – ${tijdStr}</span>
-    <span>${escHtml(gebruikersnaam)}</span>
-    ${vergrendeld ? '<span class="vergrendeld-badge">&#128274; vergrendeld</span>' : ''}`;
+  // bouw het vak als HTML
+  const vakHtml = `
+<div class="logvak" contenteditable="false">
+  <div class="vak-scheiding">════════════════════════════════════════════════════════════════</div>
+  <div class="vak-rij">
+    <span class="vak-label">Datum/Tijd</span>
+    <span class="vak-datum-tijd vak-inhoud">${datum} — ${tijd}</span>
+  </div>
+  <div class="vak-rij">
+    <span class="vak-label">Informatie</span>
+    <span class="vak-inhoud" contenteditable="true" data-placeholder="Typ hier je informatie…"></span>
+  </div>
+  <div class="vak-rij">
+    <span class="vak-label">Naam</span>
+    <span class="vak-inhoud" contenteditable="true">${naam}</span>
+  </div>
+  <div class="vak-scheiding">════════════════════════════════════════════════════════════════</div>
+</div><p><br></p>`;
 
-  const editor = document.createElement('div');
-  editor.className = 'notitie-editor';
-  editor.contentEditable = vergrendeld ? 'false' : 'true';
-  editor.innerHTML = html || '<p><br></p>';
-  editor.dataset.id = id;
-
-  if (!vergrendeld) {
-    editor.addEventListener('focus', () => { huidigeFocusId = id; });
-    editor.addEventListener('blur',  () => { if (huidigeFocusId === id) huidigeFocusId = null; });
-    editor.addEventListener('input', () => bewaarDebounced(id, editor));
-    editor.addEventListener('paste', e => verwerkPlak(e, editor));
-    editor.addEventListener('drop',  e => verwerkDrop(e, editor));
-    editor.addEventListener('dragover', e => e.preventDefault());
-  }
-
-  const footer = document.createElement('div');
-  footer.className = 'notitie-footer';
-  if (!vergrendeld) {
-    const btnOpslaan = document.createElement('button');
-    btnOpslaan.textContent = '💾 Opslaan';
-    btnOpslaan.onclick = () => bewaar(id, editor);
-
-    const btnVergrendel = document.createElement('button');
-    btnVergrendel.className = 'btn-vergrendel';
-    btnVergrendel.textContent = '🔒 Vergrendelen';
-    btnVergrendel.onclick = () => vergrendel(id, kaart, editor, header);
-
-    footer.append(btnOpslaan, btnVergrendel);
-  }
-
-  kaart.append(header, editor, footer);
-  return kaart;
-}
-
-// ── bewaren ───────────────────────────────────────────────────────────────
-
-function bewaarDebounced(id, editor) {
-  clearTimeout(bewaarTimer);
-  bewaarTimer = setTimeout(() => bewaar(id, editor), 1200);
-}
-
-async function bewaar(id, editor) {
-  clearTimeout(bewaarTimer);
-  const html = editor.innerHTML;
-  await api('PUT', `/api/notities/${id}`, { html });
-  notities[id].html = html;
-}
-
-async function vergrendel(id, kaart, editor, header) {
-  if (!confirm('Notitie vergrendelen? Dit kan niet ongedaan gemaakt worden.')) return;
-  await bewaar(id, editor);
-  await api('POST', `/api/notities/${id}/vergrendel`);
-  notities[id].vergrendeld = true;
-  editor.contentEditable = 'false';
-  const badge = document.createElement('span');
-  badge.className = 'vergrendeld-badge';
-  badge.textContent = '🔒 vergrendeld';
-  header.appendChild(badge);
-  kaart.querySelector('.notitie-footer').innerHTML = '';
-}
-
-// ── nieuwe notitie ────────────────────────────────────────────────────────
-
-async function nieuweNotitie(initieleHtml) {
-  const html = initieleHtml || '<p><br></p>';
-  const res = await api('POST', '/api/notities', { html });
-  notities[res.id] = { html, vergrendeld: false };
-  const kaart = maakKaart(res.id, res.aangemaakt, html, false);
-  const btnNieuw = document.getElementById('btn-nieuw');
-  btnNieuw.parentNode.insertBefore(kaart, btnNieuw);
-  // focus op editor
-  const editor = kaart.querySelector('.notitie-editor');
-  editor.focus();
-  // zet cursor aan einde
-  const range = document.createRange();
-  range.selectNodeContents(editor);
-  range.collapse(false);
+  // voeg in op cursorpositie of aan einde
+  doc.focus();
   const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
-  kaart.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-
-// ── opmaak ────────────────────────────────────────────────────────────────
-
-function actieveEditor() {
-  if (huidigeFocusId !== null) {
-    return document.querySelector(`.notitie-editor[data-id="${huidigeFocusId}"]`);
+  if (sel && sel.rangeCount) {
+    const range = sel.getRangeAt(0);
+    // zorg dat we binnen #document zijn
+    if (doc.contains(range.commonAncestorContainer)) {
+      range.deleteContents();
+      const tmp = document.createElement('div');
+      tmp.innerHTML = vakHtml;
+      const frag = document.createDocumentFragment();
+      let firstEl = null;
+      while (tmp.firstChild) {
+        if (!firstEl) firstEl = tmp.firstChild;
+        frag.appendChild(tmp.firstChild);
+      }
+      range.insertNode(frag);
+      // focus op informatie-veld
+      if (firstEl) {
+        const infoVeld = firstEl.querySelector('.vak-inhoud[contenteditable=true]');
+        if (infoVeld) {
+          infoVeld.focus();
+          const r = document.createRange();
+          r.selectNodeContents(infoVeld);
+          r.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(r);
+        }
+      }
+      documentGewijzigd();
+      return;
+    }
   }
-  return null;
+  // fallback: voeg toe aan einde
+  doc.insertAdjacentHTML('beforeend', vakHtml);
+  documentGewijzigd();
+  const vakken = doc.querySelectorAll('.logvak');
+  const laatste = vakken[vakken.length - 1];
+  if (laatste) {
+    const infoVeld = laatste.querySelector('.vak-inhoud[contenteditable=true]');
+    if (infoVeld) infoVeld.focus();
+    laatste.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
 }
 
-function fmt(commando) {
-  const ed = actieveEditor();
-  if (ed) ed.focus();
-  document.execCommand(commando, false, null);
+// ── bewaren ───────────────────────────────────────────────────────────────────
+
+function documentGewijzigd() {
+  setStatus('Niet opgeslagen…');
+  clearTimeout(bewaarTimer);
+  bewaarTimer = setTimeout(bewaar, 1500);
 }
 
-function fmtFont(familie) {
-  const ed = actieveEditor();
-  if (ed) ed.focus();
-  document.execCommand('fontName', false, familie);
+async function bewaar() {
+  clearTimeout(bewaarTimer);
+  setStatus('Bezig met opslaan…');
+  const res = await api('PUT', '/api/document', { html: doc.innerHTML });
+  setStatus('Opgeslagen: ' + netjesTijd(res.bijgewerkt));
 }
 
+// ── opmaak ────────────────────────────────────────────────────────────────────
+
+function fmt(cmd)        { document.execCommand(cmd, false, null); }
+function fmtFont(f)      { document.execCommand('fontName', false, f); }
+function fmtKleur(k)     { document.execCommand('foreColor', false, k); }
 function fmtSize(pt) {
-  // execCommand fontSize werkt met 1-7, we gebruiken een CSS-truc via fontsize + span
-  const ed = actieveEditor();
-  if (ed) ed.focus();
   document.execCommand('fontSize', false, '7');
-  const spans = (ed || document).querySelectorAll('font[size="7"]');
-  spans.forEach(s => {
+  doc.querySelectorAll('font[size="7"]').forEach(s => {
     s.removeAttribute('size');
     s.style.fontSize = pt + 'pt';
   });
 }
 
-function fmtKleur(kleur) {
-  const ed = actieveEditor();
-  if (ed) ed.focus();
-  document.execCommand('foreColor', false, kleur);
-}
+// ── foto ──────────────────────────────────────────────────────────────────────
 
-// ── foto ──────────────────────────────────────────────────────────────────
-
-function kiesFoto() {
-  document.getElementById('foto-input').click();
-}
+function kiesFoto() { document.getElementById('foto-input').click(); }
 
 async function uploadFoto(input) {
   const file = input.files[0];
@@ -735,48 +676,29 @@ async function uploadFoto(input) {
 async function inserteerFotoBestand(file) {
   const form = new FormData();
   form.append('file', file);
-  const res = await fetch('/api/foto', { method: 'POST', body: form });
+  const res  = await fetch('/api/foto', { method:'POST', body: form });
   const data = await res.json();
-  if (data.url) inserteerAfbeelding(data.url);
-}
-
-function inserteerAfbeelding(url) {
-  let ed = actieveEditor();
-  if (!ed) {
-    // maak nieuwe notitie aan en wacht tot editor klaar is
-    nieuweNotitie().then(() => {
-      ed = actieveEditor();
-      if (ed) _platsAfbeelding(ed, url);
-    });
-    return;
+  if (data.url) {
+    doc.focus();
+    document.execCommand('insertImage', false, data.url);
+    documentGewijzigd();
   }
-  _platsAfbeelding(ed, url);
 }
 
-function _platsAfbeelding(ed, url) {
-  ed.focus();
-  document.execCommand('insertImage', false, url);
-  bewaarDebounced(parseInt(ed.dataset.id), ed);
-}
-
-// ── plakken (Ctrl+V) ──────────────────────────────────────────────────────
-
-async function verwerkPlak(e, editor) {
+async function verwerkPlak(e) {
   const items = (e.clipboardData || window.clipboardData).items;
   for (const item of items) {
     if (item.type.startsWith('image/')) {
       e.preventDefault();
-      const blob = item.getAsFile();
-      await inserteerFotoBestand(blob);
+      await inserteerFotoBestand(item.getAsFile());
       return;
     }
   }
 }
 
-// ── drag & drop ───────────────────────────────────────────────────────────
-
+// drag & drop
 document.addEventListener('dragover', e => {
-  if ([...e.dataTransfer.items].some(i => i.kind === 'file' && i.type.startsWith('image/'))) {
+  if ([...e.dataTransfer.items].some(i => i.kind==='file' && i.type.startsWith('image/'))) {
     e.preventDefault();
     document.body.classList.add('drag-over');
   }
@@ -784,7 +706,6 @@ document.addEventListener('dragover', e => {
 document.addEventListener('dragleave', () => document.body.classList.remove('drag-over'));
 document.addEventListener('drop', async e => {
   document.body.classList.remove('drag-over');
-  if (!e.dataTransfer.files.length) return;
   for (const file of e.dataTransfer.files) {
     if (file.type.startsWith('image/')) {
       e.preventDefault();
@@ -793,16 +714,9 @@ document.addEventListener('drop', async e => {
   }
 });
 
-async function verwerkDrop(e, editor) {
-  // afgehandeld door de body-handler hierboven; zorg dat editor focus krijgt
-  huidigeFocusId = parseInt(editor.dataset.id);
-}
+// ── bestand openen ────────────────────────────────────────────────────────────
 
-// ── bestand openen ────────────────────────────────────────────────────────
-
-function kiesBestand() {
-  document.getElementById('bestand-input').click();
-}
+function kiesBestand() { document.getElementById('bestand-input').click(); }
 
 async function openBestand(input) {
   const file = input.files[0];
@@ -810,73 +724,102 @@ async function openBestand(input) {
   input.value = '';
   const form = new FormData();
   form.append('file', file);
-  const res = await fetch('/api/open', { method: 'POST', body: form });
-  if (!res.ok) {
-    const err = await res.json();
-    alert('Fout bij openen: ' + (err.error || res.statusText));
-    return;
-  }
+  const res  = await fetch('/api/open', { method:'POST', body: form });
+  if (!res.ok) { alert('Fout bij openen'); return; }
   const data = await res.json();
-  await nieuweNotitie(data.html);
+  // voeg in op cursorpositie
+  doc.focus();
+  document.execCommand('insertHTML', false, data.html);
+  documentGewijzigd();
 }
 
-// ── zoeken ────────────────────────────────────────────────────────────────
+// ── zoeken ────────────────────────────────────────────────────────────────────
 
-let zoekTimer = null;
-async function zoek(q) {
-  clearTimeout(zoekTimer);
-  zoekTimer = setTimeout(async () => {
-    const hoofd = document.getElementById('hoofd');
-    const kaarten = hoofd.querySelectorAll('.notitie-kaart');
-    if (!q.trim()) {
-      kaarten.forEach(k => k.style.display = '');
-      return;
+function zoek(q) {
+  // verwijder bestaande markeringen
+  doc.querySelectorAll('mark.zoek-mark').forEach(m => {
+    m.replaceWith(...m.childNodes);
+  });
+  doc.normalize();
+  if (!q || q.length < 2) return;
+
+  const walker = document.createTreeWalker(doc, NodeFilter.SHOW_TEXT);
+  const nodes  = [];
+  let node;
+  while ((node = walker.nextNode())) nodes.push(node);
+
+  const re = new RegExp(escRegex(q), 'gi');
+  nodes.forEach(n => {
+    if (!n.nodeValue.match(re)) return;
+    const frag = document.createDocumentFragment();
+    let last = 0, m;
+    re.lastIndex = 0;
+    while ((m = re.exec(n.nodeValue)) !== null) {
+      frag.appendChild(document.createTextNode(n.nodeValue.slice(last, m.index)));
+      const mark = document.createElement('mark');
+      mark.className = 'zoek-mark';
+      mark.style.background = '#fff176';
+      mark.textContent = m[0];
+      frag.appendChild(mark);
+      last = m.index + m[0].length;
     }
-    const res = await api('GET', `/api/zoek?q=${encodeURIComponent(q)}`);
-    const gevondenIds = new Set(res.map(r => String(r.id)));
-    kaarten.forEach(k => {
-      k.style.display = gevondenIds.has(k.dataset.id) ? '' : 'none';
-    });
-  }, 300);
+    frag.appendChild(document.createTextNode(n.nodeValue.slice(last)));
+    n.parentNode.replaceChild(frag, n);
+  });
+
+  const eerste = doc.querySelector('mark.zoek-mark');
+  if (eerste) eerste.scrollIntoView({ behavior:'smooth', block:'center' });
 }
 
-// ── export ────────────────────────────────────────────────────────────────
+// ── export ────────────────────────────────────────────────────────────────────
 
 async function exporteer() {
   const data = await api('GET', '/api/export');
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `logboek-export-${new Date().toISOString().slice(0,10)}.json`;
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `logboek-${new Date().toISOString().slice(0,10)}.json`;
   a.click();
   URL.revokeObjectURL(url);
 }
 
-// ── hulpfuncties ──────────────────────────────────────────────────────────
+// ── keyboard shortcuts ────────────────────────────────────────────────────────
+
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey) {
+    if (e.key==='b') { e.preventDefault(); fmt('bold'); }
+    if (e.key==='i') { e.preventDefault(); fmt('italic'); }
+    if (e.key==='u') { e.preventDefault(); fmt('underline'); }
+    if (e.key==='s') { e.preventDefault(); bewaar(); }
+  }
+});
+
+// ── hulpfuncties ──────────────────────────────────────────────────────────────
 
 async function api(methode, pad, body) {
   const opts = { method: methode, headers: {} };
-  if (body) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-  const res = await fetch(pad, opts);
-  return res.json();
+  if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  return (await fetch(pad, opts)).json();
 }
 
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ── keyboard shortcuts ────────────────────────────────────────────────────
-document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
-    if (e.key === 'b') { e.preventDefault(); fmt('bold'); }
-    if (e.key === 'i') { e.preventDefault(); fmt('italic'); }
-    if (e.key === 'u') { e.preventDefault(); fmt('underline'); }
-  }
-});
+function escRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function setStatus(t) {
+  document.getElementById('status-balk').textContent = t;
+}
+
+function netjesTijd(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleTimeString('nl-NL', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
 
 init();
 </script>
