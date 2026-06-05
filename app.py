@@ -374,9 +374,39 @@ body {
 #document img {
   max-width: 100%;
   height: auto;
-  display: block;
+  display: inline-block;
+  margin: 6px 0;
+  cursor: pointer;
+  vertical-align: bottom;
+}
+#document img.geselecteerd {
+  outline: 2px solid #2255bb;
+}
+
+/* resize-wrapper */
+.img-resize-wrap {
+  display: inline-block;
+  position: relative;
+  line-height: 0;
   margin: 6px 0;
 }
+.img-resize-wrap img {
+  display: block;
+  margin: 0;
+}
+.resize-greep {
+  position: absolute;
+  width: 10px; height: 10px;
+  background: #2255bb;
+  border: 1px solid white;
+  border-radius: 2px;
+  z-index: 10;
+  cursor: se-resize;
+}
+.resize-greep.rb { bottom: -5px; right: -5px; cursor: se-resize; }
+.resize-greep.lb { bottom: -5px; left:  -5px; cursor: sw-resize; }
+.resize-greep.rt { top:    -5px; right: -5px; cursor: ne-resize; }
+.resize-greep.lt { top:    -5px; left:  -5px; cursor: nw-resize; }
 
 /* ── naam-modal ── */
 #naam-modal {
@@ -823,6 +853,89 @@ function netjesTijd(iso) {
   const d = new Date(iso);
   return d.toLocaleTimeString('nl-NL', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
 }
+
+// ── afbeelding resizen ────────────────────────────────────────────────────────
+
+let actieveWrap = null;
+
+function selecteerAfbeelding(img) {
+  // verwijder eerdere selectie
+  deselecteerAlles();
+
+  const wrap = document.createElement('span');
+  wrap.className = 'img-resize-wrap';
+  wrap.contentEditable = 'false';
+
+  img.parentNode.insertBefore(wrap, img);
+  wrap.appendChild(img);
+
+  ['lt','rt','lb','rb'].forEach(pos => {
+    const greep = document.createElement('span');
+    greep.className = `resize-greep ${pos}`;
+    greep.addEventListener('mousedown', e => startResize(e, img, wrap, pos));
+    wrap.appendChild(greep);
+  });
+
+  img.classList.add('geselecteerd');
+  actieveWrap = wrap;
+}
+
+function deselecteerAlles() {
+  document.querySelectorAll('.img-resize-wrap').forEach(w => {
+    const img = w.querySelector('img');
+    if (img) {
+      img.classList.remove('geselecteerd');
+      w.parentNode.insertBefore(img, w);
+    }
+    w.remove();
+  });
+  actieveWrap = null;
+}
+
+function startResize(e, img, wrap, pos) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  const startX  = e.clientX;
+  const startW  = img.offsetWidth;
+  const startH  = img.offsetHeight;
+  const ratio   = startH / startW;
+  const linksPos = pos === 'lt' || pos === 'lb';
+
+  function onMove(ev) {
+    const dx   = linksPos ? startX - ev.clientX : ev.clientX - startX;
+    const nieuwW = Math.max(40, startW + dx);
+    const nieuwH = Math.round(nieuwW * ratio);
+    img.style.width  = nieuwW + 'px';
+    img.style.height = nieuwH + 'px';
+  }
+
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup',   onUp);
+    documentGewijzigd();
+  }
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup',   onUp);
+}
+
+// klik op afbeelding → selecteren; klik ergens anders → deselecteren
+doc.addEventListener('click', e => {
+  if (e.target.tagName === 'IMG' && doc.contains(e.target)) {
+    e.preventDefault();
+    selecteerAfbeelding(e.target);
+  } else if (!e.target.closest('.img-resize-wrap')) {
+    deselecteerAlles();
+  }
+});
+
+// bij bewaren: verwijder resize-wraps (img behoudt width/height als inline stijl)
+const origBewaar = bewaar;
+bewaar = async function() {
+  deselecteerAlles();
+  await origBewaar();
+};
 
 init();
 </script>
