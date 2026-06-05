@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+logboek.db
+fotos/
+*.egg-info/
+.env
